@@ -381,7 +381,17 @@ function detectExteriorBackgroundMask(rgb224: Uint8Array | Buffer): Uint8Array {
   const N = 224 * 224;
   const bgMask = new Uint8Array(N);
 
+  const isGreenFoliageWall = (idx: number): boolean => {
+    const p = idx * 3;
+    const r = rgb224[p];
+    const g = rgb224[p + 1];
+    const b = rgb224[p + 2];
+    const exG = (2 * g - r - b) / 255;
+    return exG > 0.048 && g > b + 4 && g > r - 6;
+  };
+
   const isNonFoliagePixel = (idx: number): boolean => {
+    if (isGreenFoliageWall(idx)) return false;
     const p = idx * 3;
     const r = rgb224[p];
     const g = rgb224[p + 1];
@@ -392,12 +402,16 @@ function detectExteriorBackgroundMask(rgb224: Uint8Array | Buffer): Uint8Array {
     const sat = maxC > 0 ? (maxC - minC) / maxC : 0;
     const luma = (r + g + b) / 3;
 
-    // Cool pale-blue / cyan / neutral gray studio shadow (b >= g - 3, never foliage green or brown necrosis)
+    // Cool pale-blue / cyan / neutral gray studio shadow
     if (b >= g - 3 && r <= g + 4 && luma > 120 && sat < 0.32) {
       return true;
     }
     // Bright white, light gray, or pale studio backdrop
     if (luma > 168 && sat < 0.25 && exG < 0.045 && g - b < 15 && r - b < 16) {
+      return true;
+    }
+    // Warm out-of-focus outdoor bokeh / soil / wall / cream backdrop touching border
+    if (luma > 125 && exG < 0.025 && r - g < 42 && sat < 0.45) {
       return true;
     }
     // Neutral mid/dark gray or black studio backdrop
@@ -421,7 +435,7 @@ function detectExteriorBackgroundMask(rgb224: Uint8Array | Buffer): Uint8Array {
     bgMask[idx] = 1;
     queue[tail++] = idx;
 
-    if (swatches.length < 24 && (x + y) % 14 === 0) {
+    if (swatches.length < 28 && (x + y) % 12 === 0) {
       const p = idx * 3;
       swatches.push([rgb224[p], rgb224[p + 1], rgb224[p + 2]]);
     }
@@ -476,17 +490,18 @@ function detectExteriorBackgroundMask(rgb224: Uint8Array | Buffer): Uint8Array {
       const exG = (2 * ng - nr - nb) / 255;
 
       const isBrightBackdrop = luma > 172 && sat < 0.24 && exG < 0.03;
-      if (stepDist < 24 || minSwatchDist < 44 || isBrightBackdrop) {
+      const isSmoothWarmBokeh = luma > 125 && exG < 0.025 && stepDist < 22 && minSwatchDist < 48;
+      if (stepDist < 24 || minSwatchDist < 44 || isBrightBackdrop || isSmoothWarmBokeh) {
         bgMask[nIdx] = 1;
         queue[tail++] = nIdx;
       }
     }
   }
 
-  // Sanity guard: if flood fill ever consumed >92% of the frame, revert to safe bright-neutral exclusion
+  // Sanity guard: if flood fill ever consumed >90% of the frame, revert to safe bright-neutral exclusion
   let bgCount = 0;
   for (let i = 0; i < N; i++) bgCount += bgMask[i];
-  if (bgCount > N * 0.92) {
+  if (bgCount > N * 0.90) {
     bgMask.fill(0);
     for (let i = 0; i < N; i++) {
       const p = i * 3;
@@ -528,7 +543,7 @@ function writeRgbToBgrFloat32(
  * Exact Keras resnet50.preprocess_input(caffe) across 3 complementary views:
  *   View 0: fit='fill' (1:1 aligned with frontend Grad-CAM canvas)
  *   View 1: fit='cover' (aspect-ratio-preserving center crop)
- *   View 2: fit='contain' with bright/dark studio backdrops normalized to PlantVillage gray (128,128,128)
+ *   View 2: foreground leaf bounding-box crop -> fit='contain' + studio-gray (128,128,128) normalization
  */
 async function preprocessImageViewsToTensor(imageBuffer: Buffer): Promise<{
   tensorBatch: tf.Tensor4D;
@@ -536,25 +551,123 @@ async function preprocessImageViewsToTensor(imageBuffer: Buffer): Promise<{
   height: number;
   rgb224: Buffer;
 }> {
-  const meta = await sharp(imageBuffer).metadata();
-  const base = sharp(imageBuffer).rotate().removeAlpha();
+  const rawMeta = await sharp(imageBuffer).metadata();
+  const oriented = await sharp(imageBuffer)
+    .rotate()
+    .removeAlpha()
+    .resize(640, 640, { fit: 'inside', withoutEnlargement: true })
+    .png()
+    .toBuffer({ resolveWithObject: true });
 
-  const [rgbFill, rgbCover, rgbContain] = await Promise.all([
+  const orientedW = oriented.info.width;
+  const orientedH = oriented.info.height;
+  const base = sharp(oriented.data);
+
+  const [rgbFill, rgbCover] = await Promise.all([
     base.clone().resize(224, 224, { fit: 'fill' }).raw().toBuffer(),
     base
       .clone()
       .resize(224, 224, { fit: 'cover', position: 'centre' })
       .raw()
       .toBuffer(),
-    base
-      .clone()
-      .resize(224, 224, {
-        fit: 'contain',
-        background: { r: 128, g: 128, b: 128 },
-      })
-      .raw()
-      .toBuffer(),
   ]);
+
+  // Locate foreground leaf bounding box from View 0 mask so off-center leaves on white/wide canvases get tightly framed
+  const bgMaskFill = detectExteriorBackgroundMask(rgbFill);
+  let minX = 224;
+  let maxX = -1;
+  let minY = 224;
+  let maxY = -1;
+  let leafPx = 0;
+  for (let y = 0; y < 224; y++) {
+    for (let x = 0; x < 224; x++) {
+      if (bgMaskFill[y * 224 + x] === 0) {
+        leafPx++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  // Detect whether image has a flat pure-white studio cutout backdrop (luma > 228, low variance)
+  // so blinding #FFFFFF stock backgrounds don't bias View 1 cover features
+  let bgSumLuma = 0;
+  let bgSqLuma = 0;
+  let bgTotal = 0;
+  for (let i = 0; i < 224 * 224; i++) {
+    if (bgMaskFill[i]) {
+      const p = i * 3;
+      const l = (rgbFill[p] + rgbFill[p + 1] + rgbFill[p + 2]) / 3;
+      bgSumLuma += l;
+      bgSqLuma += l * l;
+      bgTotal++;
+    }
+  }
+  const bgFracFill = bgTotal / (224 * 224);
+  const bgMeanLuma = bgTotal > 0 ? bgSumLuma / bgTotal : 0;
+  const bgStdLuma =
+    bgTotal > 0
+      ? Math.sqrt(Math.max(0, bgSqLuma / bgTotal - bgMeanLuma * bgMeanLuma))
+      : 99;
+  const isFlatWhiteCutout =
+    bgFracFill >= 0.18 && bgMeanLuma > 226 && bgStdLuma < 20;
+
+  const rgbCoverNorm = Buffer.from(rgbCover);
+  if (isFlatWhiteCutout) {
+    const bgMaskCover = detectExteriorBackgroundMask(rgbCoverNorm);
+    for (let i = 0; i < 224 * 224; i++) {
+      if (bgMaskCover[i]) {
+        const p = i * 3;
+        const luma =
+          (rgbCoverNorm[p] + rgbCoverNorm[p + 1] + rgbCoverNorm[p + 2]) / 3;
+        if (luma > 210) {
+          rgbCoverNorm[p] = 182;
+          rgbCoverNorm[p + 1] = 186;
+          rgbCoverNorm[p + 2] = 190;
+        }
+      }
+    }
+  }
+
+  let view2Pipe = base.clone();
+  const leafAreaFrac = leafPx / (224 * 224);
+  if (
+    maxX > minX + 16 &&
+    maxY > minY + 16 &&
+    leafAreaFrac > 0.08 &&
+    leafAreaFrac < 0.86
+  ) {
+    const padX = Math.round(((maxX - minX) / 224) * orientedW * 0.06);
+    const padY = Math.round(((maxY - minY) / 224) * orientedH * 0.06);
+    const left = Math.max(0, Math.floor((minX / 224) * orientedW) - padX);
+    const top = Math.max(0, Math.floor((minY / 224) * orientedH) - padY);
+    const right = Math.min(
+      orientedW,
+      Math.ceil(((maxX + 1) / 224) * orientedW) + padX
+    );
+    const bottom = Math.min(
+      orientedH,
+      Math.ceil(((maxY + 1) / 224) * orientedH) + padY
+    );
+    if (right - left >= 32 && bottom - top >= 32) {
+      view2Pipe = view2Pipe.extract({
+        left,
+        top,
+        width: right - left,
+        height: bottom - top,
+      });
+    }
+  }
+
+  const rgbContain = await view2Pipe
+    .resize(224, 224, {
+      fit: 'contain',
+      background: { r: 128, g: 128, b: 128 },
+    })
+    .raw()
+    .toBuffer();
 
   // Normalize non-foliage bright/dark studio backdrops on View 2 to PlantVillage gray (128,128,128)
   const bgMaskContain = detectExteriorBackgroundMask(rgbContain);
@@ -575,22 +688,22 @@ async function preprocessImageViewsToTensor(imageBuffer: Buffer): Promise<{
   const stride = 224 * 224 * 3;
   const batchBgr = new Float32Array(3 * stride);
   writeRgbToBgrFloat32(rgbFill, batchBgr, 0);
-  writeRgbToBgrFloat32(rgbCover, batchBgr, stride);
+  writeRgbToBgrFloat32(rgbCoverNorm, batchBgr, stride);
   writeRgbToBgrFloat32(rgbContainNorm, batchBgr, 2 * stride);
 
   return {
     tensorBatch: tf.tensor4d(batchBgr, [3, 224, 224, 3]),
-    width: meta.width || 224,
-    height: meta.height || 224,
+    width: rawMeta.width || orientedW,
+    height: rawMeta.height || orientedH,
     rgb224: rgbFill,
   };
 }
 
 /**
- * Pre-softmax Logit Grad-CAM on conv5_block3_out [7, 7, 2048]
- * (avoids softmax gradient vanishing when top-1 confidence approaches 100%)
- * refined onto a 14x14 leaf-foreground-gated activation grid so empty studio
- * corners never hijack normalization and lesion boundaries remain sharp.
+ * Contrastive Pre-Softmax Logit Grad-CAM on conv5_block3_out [7, 7, 2048]
+ * (cancels out shared healthy-lamina crop features against same-crop healthy weights)
+ * refined onto a 28x28 leaf-foreground-gated activation grid so studio corners
+ * never leak halos and disease lesions stay sharp.
  */
 function computeRefinedGradCam(
   conv5Data: Float32Array,
@@ -598,45 +711,78 @@ function computeRefinedGradCam(
   predictedIdx: number,
   weights: ResNet50ModelWeights,
   rgb224: Buffer,
-  isHealthy: boolean
+  isHealthy: boolean,
+  cropName: string
 ): { gradCamGrid: number[]; gradCamGridSize: number; leafCoverageEstimate: number } {
-  // 1. Pre-softmax logit gradient: d(logit_c)/d(logits) = e_c
-  const dHead = new Float32Array(256);
   const w2 = weights.predKernelArr; // [256, 38]
+  const w1 = weights.headDenseKernelArr; // [2048, 256]
+
+  // Locate matching healthy class index for contrastive disease vs healthy gradient filtering
+  let healthyContrastIdx = -1;
+  if (!isHealthy) {
+    healthyContrastIdx = PLANT_VILLAGE_CLASSES.findIndex(
+      (c) => c.crop === cropName && c.isHealthy
+    );
+  }
+
+  // 1. Pre-softmax logit gradient + contrastive healthy suppression
+  const dHeadStd = new Float32Array(256);
+  const dHeadDiff = new Float32Array(256);
   for (let i = 0; i < 256; i++) {
-    const grad = w2[i * NUM_CLASSES + predictedIdx];
-    dHead[i] = headPreRelu[i] > 0 ? grad : 0;
+    if (headPreRelu[i] > 0) {
+      const targetGrad = w2[i * NUM_CLASSES + predictedIdx];
+      dHeadStd[i] = targetGrad;
+      if (healthyContrastIdx >= 0 && healthyContrastIdx !== predictedIdx) {
+        const healthyGrad = w2[i * NUM_CLASSES + healthyContrastIdx];
+        dHeadDiff[i] = targetGrad - 0.55 * healthyGrad;
+      } else {
+        dHeadDiff[i] = targetGrad;
+      }
+    }
   }
 
   // 2. Backprop through head_dense (2048 -> 256) and GlobalAveragePooling2D (1/49)
-  const pooledGrads = new Float32Array(2048);
-  const w1 = weights.headDenseKernelArr; // [2048, 256]
+  const pooledStd = new Float32Array(2048);
+  const pooledDiff = new Float32Array(2048);
   for (let k = 0; k < 2048; k++) {
-    let sum = 0;
+    let sumStd = 0;
+    let sumDiff = 0;
     const rowOff = k * 256;
     for (let i = 0; i < 256; i++) {
-      sum += dHead[i] * w1[rowOff + i];
+      const w = w1[rowOff + i];
+      sumStd += dHeadStd[i] * w;
+      sumDiff += dHeadDiff[i] * w;
     }
-    pooledGrads[k] = sum / 49;
+    pooledStd[k] = sumStd / 49;
+    pooledDiff[k] = sumDiff / 49;
   }
 
-  // 3. Raw 7x7 conv5_block3_out Grad-CAM + ReLU
+  // 3. Raw 7x7 conv5_block3_out Grad-CAM + Contrastive ReLU blend
   const cam7 = new Float32Array(49);
   for (let p = 0; p < 49; p++) {
     const featOff = p * 2048;
-    let acc = 0;
+    let accStd = 0;
+    let accDiff = 0;
     for (let k = 0; k < 2048; k++) {
-      acc += pooledGrads[k] * conv5Data[featOff + k];
+      const f = conv5Data[featOff + k];
+      accStd += pooledStd[k] * f;
+      accDiff += pooledDiff[k] * f;
     }
-    cam7[p] = Math.max(0, acc);
+    const stdPos = Math.max(0, accStd);
+    const diffPos = Math.max(0, accDiff);
+    cam7[p] = !isHealthy && healthyContrastIdx >= 0
+      ? 0.65 * diffPos + 0.35 * stdPos
+      : stdPos;
   }
 
   // 4. Exterior border flood-fill separates studio backdrop cleanly from leaf & interior lesions
   const bgMask224 = detectExteriorBackgroundMask(rgb224);
 
-  // 5. Build 224x224 foreground leaf mask and interior lesion contrast map
+  // 5. Build 224x224 foreground leaf mask, green-lamina mask, and interior lesion contrast map
   const leafMask224 = new Uint8Array(224 * 224);
+  const greenMask224 = new Uint8Array(224 * 224);
   const lesion224 = new Float32Array(224 * 224);
+  let greenCountTotal = 0;
 
   for (let i = 0; i < 224 * 224; i++) {
     if (bgMask224[i] === 0) {
@@ -645,21 +791,28 @@ function computeRefinedGradCam(
       const g = rgb224[p + 1];
       const b = rgb224[p + 2];
       const exG = (2 * g - r - b) / 255;
+      const luma = (r + g + b) / 3;
+      const maxC = Math.max(r, g, b);
 
       leafMask224[i] = 1;
+      if (exG > 0.055 && g > b + 4 && g > r - 5) {
+        greenMask224[i] = 1;
+        greenCountTotal++;
+      }
+
       if (!isHealthy) {
-        const necrosis = Math.max(0, (r - g * 0.84) / 72);
+        const necrosis = r > g + 8 ? Math.max(0, (r - g * 0.88) / 68) : 0;
         const chlorosis =
-          r > 110 && g > 105 && b < 95 && exG < 0.24
-            ? Math.max(0, (r - b) / 145) * 0.85
+          r > 112 && g > 105 && b < 95 && exG < 0.22
+            ? Math.max(0, (r - b) / 140) * 0.85
             : 0;
         const darkSpot =
-          exG < 0.13 && g < 115 && b < 105 && r > 32
-            ? Math.max(0, (0.13 - exG) * 4.2)
+          exG < 0.095 && luma < 120 && maxC < 140
+            ? Math.min(1, (120 - luma) / 58 + Math.max(0, 0.095 - exG) * 2.8)
             : 0;
         const mildew =
-          r > 165 && g > 165 && b > 155 && exG < 0.12 ? 0.65 : 0;
-        lesion224[i] = Math.min(1, necrosis + chlorosis + darkSpot + mildew);
+          r > 170 && g > 170 && b > 160 && exG < 0.10 ? 0.65 : 0;
+        lesion224[i] = Math.min(1, Math.max(necrosis + chlorosis, darkSpot, mildew));
       }
     }
   }
@@ -676,7 +829,7 @@ function computeRefinedGradCam(
             leafMask224[y * 224 + (x - 2)] +
             leafMask224[y * 224 + (x + 2)];
           if (borderCheck < 4) {
-            lesion224[idx] *= 0.25;
+            lesion224[idx] *= 0.2;
           }
         }
       }
@@ -708,10 +861,15 @@ function computeRefinedGradCam(
     cam7Norm[p] = Math.min(1, cam7[p] / denom7);
   }
 
-  // 7. Upsample onto a 14x14 grid (16x16 px per cell) fused with leaf-gated lesion saliency
-  const gridSize = 14;
+  // 7. Upsample onto a high-res 28x28 grid (8x8 px per cell) fused with leaf-gated lesion saliency
+  const gridSize = 28;
+  const cellPx = 224 / gridSize; // 8
+  const cellArea = cellPx * cellPx; // 64
   const rawGrid = new Float32Array(gridSize * gridSize);
-  let maxGrid = 0;
+  const cellLeafGate = new Float32Array(gridSize * gridSize);
+  const cellGreenFrac = new Float32Array(gridSize * gridSize);
+  const cellLesionAvg = new Float32Array(gridSize * gridSize);
+  const cellCam7Val = new Float32Array(gridSize * gridSize);
 
   for (let r = 0; r < gridSize; r++) {
     const fy = Math.max(0, Math.min(6, ((r + 0.5) / gridSize) * 7 - 0.5));
@@ -730,39 +888,78 @@ function computeRefinedGradCam(
           (1 - wy) +
         (cam7Norm[y1 * 7 + x0] * (1 - wx) + cam7Norm[y1 * 7 + x1] * wx) * wy;
 
-      let leafPx = 0;
+      let leafPxCell = 0;
+      let greenPxCell = 0;
       let lesionSum = 0;
-      for (let py = r * 16; py < (r + 1) * 16; py++) {
-        for (let px = c * 16; px < (c + 1) * 16; px++) {
+      for (let py = r * cellPx; py < (r + 1) * cellPx; py++) {
+        for (let px = c * cellPx; px < (c + 1) * cellPx; px++) {
           const idx = py * 224 + px;
           if (leafMask224[idx]) {
-            leafPx++;
+            leafPxCell++;
+            greenPxCell += greenMask224[idx];
             lesionSum += lesion224[idx];
           }
         }
       }
 
-      const leafFrac = leafPx / 256;
-      const avgLesion = leafPx > 0 ? lesionSum / leafPx : 0;
-      const leafGate = Math.min(1, leafFrac / 0.45);
-
-      const val = isHealthy
-        ? leafGate * c7 * 0.32
-        : leafGate *
-          (Math.pow(c7, 0.72) * 0.46 +
-            avgLesion * 0.44 +
-            c7 * avgLesion * 0.55);
-
-      rawGrid[r * gridSize + c] = val;
-      if (val > maxGrid) maxGrid = val;
+      const cellIdx = r * gridSize + c;
+      const leafFrac = leafPxCell / cellArea;
+      cellGreenFrac[cellIdx] = greenPxCell / cellArea;
+      cellLesionAvg[cellIdx] = leafPxCell > 0 ? lesionSum / leafPxCell : 0;
+      cellCam7Val[cellIdx] = c7;
+      cellLeafGate[cellIdx] = leafFrac < 0.08 ? 0 : Math.min(1, leafFrac / 0.35);
     }
   }
 
-  // Light 3x3 smoothing on the 14x14 grid for organic spatial continuity
+  const hasGreenFoliage = greenCountTotal > 224 * 224 * 0.12;
+  for (let r = 0; r < gridSize; r++) {
+    for (let c = 0; c < gridSize; c++) {
+      const cellIdx = r * gridSize + c;
+      const gate = cellLeafGate[cellIdx];
+      if (gate === 0) {
+        rawGrid[cellIdx] = 0;
+        continue;
+      }
+
+      let greenNb = 0;
+      let nbCount = 0;
+      for (let dr = -2; dr <= 2; dr++) {
+        for (let dc = -2; dc <= 2; dc++) {
+          const nr = r + dr;
+          const nc = c + dc;
+          if (nr >= 0 && nr < gridSize && nc >= 0 && nc < gridSize) {
+            greenNb += cellGreenFrac[nr * gridSize + nc];
+            nbCount++;
+          }
+        }
+      }
+      const localGreenSupport = nbCount > 0 ? greenNb / nbCount : 0;
+      const foliageSupportWeight = hasGreenFoliage
+        ? Math.max(0.15, Math.min(1, localGreenSupport / 0.14))
+        : 1;
+
+      const c7 = cellCam7Val[cellIdx];
+      const avgLesion = cellLesionAvg[cellIdx] * foliageSupportWeight;
+      rawGrid[cellIdx] = isHealthy
+        ? gate * c7 * 0.25
+        : gate *
+          foliageSupportWeight *
+          (Math.pow(c7, 0.85) * 0.35 +
+            avgLesion * 0.45 +
+            c7 * avgLesion * 0.70);
+    }
+  }
+
+  // Smooth 3x3 only within leaf tissue, then re-apply strict leafGate so NO halo bleeds into background
   const smoothed = new Float32Array(gridSize * gridSize);
   let maxSmoothed = 0;
   for (let r = 0; r < gridSize; r++) {
     for (let c = 0; c < gridSize; c++) {
+      const centerIdx = r * gridSize + c;
+      if (cellLeafGate[centerIdx] === 0) {
+        smoothed[centerIdx] = 0;
+        continue;
+      }
       let acc = 0;
       let wSum = 0;
       for (let dr = -1; dr <= 1; dr++) {
@@ -770,30 +967,37 @@ function computeRefinedGradCam(
           const nr = r + dr;
           const nc = c + dc;
           if (nr >= 0 && nr < gridSize && nc >= 0 && nc < gridSize) {
+            const nIdx = nr * gridSize + nc;
+            if (cellLeafGate[nIdx] === 0) continue;
             const wt = dr === 0 && dc === 0 ? 4 : dr === 0 || dc === 0 ? 2 : 1;
-            acc += rawGrid[nr * gridSize + nc] * wt;
+            acc += rawGrid[nIdx] * wt;
             wSum += wt;
           }
         }
       }
-      const v = acc / wSum;
-      smoothed[r * gridSize + c] = v;
+      const v = (wSum > 0 ? acc / wSum : 0) * cellLeafGate[centerIdx];
+      smoothed[centerIdx] = v;
       if (v > maxSmoothed) maxSmoothed = v;
     }
   }
 
   const gradCamGrid: number[] = new Array(gridSize * gridSize);
   const normDenom = isHealthy
-    ? Math.max(0.32, maxSmoothed)
-    : maxSmoothed + 1e-8;
+    ? Math.max(0.28, maxSmoothed)
+    : Math.max(0.18, maxSmoothed) + 1e-8;
   for (let i = 0; i < gradCamGrid.length; i++) {
+    if (cellLeafGate[i] === 0) {
+      gradCamGrid[i] = 0;
+      continue;
+    }
+    const rawRatio = smoothed[i] / normDenom;
     const scaled = isHealthy
-      ? Math.min(0.34, (smoothed[i] / (maxSmoothed + 1e-8)) * 0.32)
-      : smoothed[i] / normDenom;
+      ? Math.min(0.26, (smoothed[i] / (maxSmoothed + 1e-8)) * 0.25)
+      : Math.pow(Math.max(0, Math.min(1, rawRatio)), 1.3);
     gradCamGrid[i] = Number(Math.max(0, Math.min(1, scaled)).toFixed(4));
   }
 
-  // 8. Compute symptomatic leaf coverage directly from foreground pixels with active Grad-CAM
+  // 8. Compute symptomatic leaf coverage directly from foreground pixels with focal Grad-CAM activation
   let totalLeafPixels = 0;
   let activeLesionPixels = 0;
   if (!isHealthy) {
@@ -803,7 +1007,7 @@ function computeRefinedGradCam(
         if (leafMask224[y * 224 + x]) {
           totalLeafPixels++;
           const gx = Math.min(gridSize - 1, Math.floor((x / 224) * gridSize));
-          if (gradCamGrid[gy * gridSize + gx] >= 0.34) {
+          if (gradCamGrid[gy * gridSize + gx] >= 0.42) {
             activeLesionPixels++;
           }
         }
@@ -904,7 +1108,8 @@ export async function analyzeLeafWithResNet50(
         best.index,
         weights,
         rgb224,
-        canonical.isHealthy
+        canonical.isHealthy,
+        canonical.crop
       );
 
     const second = indexed[1];

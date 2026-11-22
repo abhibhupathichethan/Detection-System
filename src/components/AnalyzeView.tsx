@@ -152,9 +152,9 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
     const field = computeGradCamField(
       loadedImg,
       analysis.gradCamGrid,
-      analysis.gradCamGridSize || 14,
+      analysis.gradCamGridSize || 28,
       analysis.isHealthy,
-      112
+      168
     );
     gradCamFieldRef.current = field;
 
@@ -416,7 +416,7 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
               </div>
               <div className="flex justify-between gap-2">
                 <dt className="text-slate-500 font-sans">Dataset</dt>
-                <dd className="text-slate-800">PlantVillage (Kaggle)</dd>
+                <dd className="text-slate-800">PlantVillage + PlantDoc/Wild</dd>
               </div>
               <div className="flex justify-between gap-2">
                 <dt className="text-slate-500 font-sans">Inference Time</dt>
@@ -427,16 +427,6 @@ export const AnalyzeView: React.FC<AnalyzeViewProps> = ({
                 </dd>
               </div>
             </dl>
-            <div className="mt-4 pt-3 border-t border-slate-100">
-              <a
-                href="/api/download-source"
-                download="phytoscan-resnet50.zip"
-                className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-slate-50 border border-slate-200 rounded-md hover:bg-slate-100 transition-colors whitespace-nowrap"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download Project Code (.zip)
-              </a>
-            </div>
           </section>
         </aside>
 

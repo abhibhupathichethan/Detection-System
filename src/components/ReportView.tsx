@@ -146,10 +146,9 @@ ${topMatches
 
 ---
 
-## Model & Dataset Reference
+## Dataset Reference
 
-- **Implementation**: Python (TensorFlow / Keras ResNet50, OpenCV Grad-CAM on \`conv5_block3_out\`)
-- **Dataset**: PlantVillage Dataset (Source: Kaggle · 38 crop & disease classes)
+- **Training Datasets**: PlantVillage + PlantDoc, PlantWild & PlantSeg (38 Classes)
 `;
   };
 
@@ -462,13 +461,10 @@ ${topMatches
             </div>
           </section>
 
-          {/* Compact Technical Basis Footer inside Report */}
-          <section className="pt-5 border-t border-slate-200 text-xs text-slate-500 flex flex-wrap items-center justify-between gap-2">
-            <span>
-              Implementation: Python (TensorFlow / Keras ResNet50 &amp; OpenCV Grad-CAM)
-            </span>
+          {/* Compact Dataset Reference Footer inside Report */}
+          <section className="pt-5 border-t border-slate-200 text-xs text-slate-500 flex flex-wrap items-center justify-end gap-2">
             <span className="font-mono">
-              Dataset: PlantVillage (Source: Kaggle · 38 Classes)
+              Datasets: PlantVillage + PlantDoc/Wild/Seg (38 Classes)
             </span>
           </section>
         </div>

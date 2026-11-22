@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Download } from 'lucide-react';
 import { AnalyzeView } from './components/AnalyzeView';
 import { HistoryView } from './components/HistoryView';
 import { ReportView } from './components/ReportView';
@@ -101,24 +100,54 @@ export default function App() {
 
     try {
       const { base64, mimeType, width, height } = await imageUrlToBase64(src);
-      const response = await fetch('/api/analyze-leaf', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          imageBase64: base64,
-          mimeType,
-          imageWidth: width,
-          imageHeight: height,
-        }),
+      const requestBody = JSON.stringify({
+        imageBase64: base64,
+        mimeType,
+        imageWidth: width,
+        imageHeight: height,
       });
 
-      const payload = await response.json();
-      if (reqId !== requestCounterRef.current) return;
+      let response: Response | null = null;
+      let rawText = '';
+      for (let attempt = 0; attempt < 3; attempt++) {
+        response = await fetch('/api/analyze-leaf', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: requestBody,
+        });
+        if (reqId !== requestCounterRef.current) return;
 
-      if (!response.ok) {
-        throw new Error(
-          payload?.error || `Server responded with ${response.status}`
-        );
+        rawText = await response.text();
+        const isTransientProxy =
+          response.status === 429 ||
+          response.status === 502 ||
+          response.status === 503 ||
+          /rate exceeded/i.test(rawText);
+
+        if (!isTransientProxy || attempt === 2) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 900 * (attempt + 1)));
+        if (reqId !== requestCounterRef.current) return;
+      }
+
+      if (!response) {
+        throw new Error('No response received from analysis server.');
+      }
+
+      let payload: Record<string, unknown> | null = null;
+      try {
+        payload = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : null;
+      } catch {
+        payload = null;
+      }
+
+      if (!response.ok || !payload) {
+        const errText =
+          (payload && typeof payload.error === 'string' && payload.error) ||
+          (rawText && rawText.trim().slice(0, 140)) ||
+          `Server responded with ${response.status}`;
+        throw new Error(errText);
       }
 
       const result = payload as LeafAnalysisResult;
@@ -285,15 +314,7 @@ export default function App() {
             })}
           </nav>
 
-          <div className="hidden sm:flex items-center gap-2.5 shrink-0">
-            <a
-              href="/api/download-source"
-              download="phytoscan-resnet50.zip"
-              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0"
-            >
-              <Download className="w-3.5 h-3.5" />
-              Download Code (.zip)
-            </a>
+          <div className="hidden sm:flex items-center shrink-0">
             <button
               type="button"
               onClick={() => setActiveTab('report')}
