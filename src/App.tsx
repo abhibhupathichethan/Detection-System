@@ -150,7 +150,7 @@ export default function App() {
         throw new Error(errText);
       }
 
-      const result = payload as LeafAnalysisResult;
+      const result = payload as unknown as LeafAnalysisResult;
       const newRecordId = `${Date.now()}-${Math.random()
         .toString(36)
         .slice(2, 7)}`;
