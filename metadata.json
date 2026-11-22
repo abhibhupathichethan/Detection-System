@@ -1,0 +1,6 @@
+{
+  "name": "PhytoScan — Plant Disease Detection (Phase 1)",
+  "description": "Dissertation Phase 1 review application for automated plant leaf disease detection using ResNet50 transfer learning, Grad-CAM explainability, diagnosis history, and Phase 1 report generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
